@@ -5,8 +5,8 @@ import os
 import msvcrt
 from typing import List, Dict, Any
 
-API_KEY = "50c06a756c3320f7dacf0db981cee110"
-NICKNAME = "SpurcatuI"
+API_KEY = "your wot api key"
+NICKNAME = "your wot nickname"
 REGION = "eu"
 
 MIN_TIER = 8
