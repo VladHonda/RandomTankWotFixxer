@@ -1,120 +1,194 @@
 import requests
-import secrets
+import random
+import json
+import os
+import msvcrt
 from typing import List, Dict, Any
 
 API_KEY = "50c06a756c3320f7dacf0db981cee110"
 NICKNAME = "SpurcatuI"
 REGION = "eu"
+
 MIN_TIER = 8
 MAX_TIER = 11
-HISTORY_SIZE = 10
+
+HISTORY_SIZE = 20
+HISTORY_FILE = "last_tanks.json"
 
 BASE_URL = f"https://api.worldoftanks.{REGION}/wot"
+
 last_played: List[int] = []
 
-# --- Get account ID ---
-resp = requests.get(
-    f"{BASE_URL}/account/list/",
-    params={"application_id": API_KEY, "search": NICKNAME, "limit": 1}
-).json()
 
-if resp.get("status") != "ok" or not resp.get("data"):
-    print("❌ Player not found.")
-    exit()
+def load_history() -> List[int]:
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r") as f:
+                return [int(x) for x in json.load(f)]
+        except Exception:
+            pass
+    return []
 
-account_id = resp["data"][0]["account_id"]
+
+def save_history(history: List[int]) -> None:
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f)
+
+
+def get_account_id() -> int:
+    resp = requests.get(
+        f"{BASE_URL}/account/list/",
+        params={
+            "application_id": API_KEY,
+            "search": NICKNAME,
+            "limit": 1,
+        },
+        timeout=10,
+    ).json()
+
+    if resp.get("status") != "ok" or not resp.get("data"):
+        raise RuntimeError("Player not found")
+
+    return resp["data"][0]["account_id"]
+
+
+print("Loading account...")
+
+account_id = get_account_id()
+
 print(f"Account ID: {account_id}")
 
-# ── Get REAL personal tank statistics ──
-resp = requests.get(
+print("Downloading tank stats...")
+
+stats_resp = requests.get(
     f"{BASE_URL}/tanks/stats/",
     params={
         "application_id": API_KEY,
         "account_id": account_id,
-        # "extra": "random.",           # uneori ajută la mai multe date, dar nu e obligatoriu
-        # "fields": ",".join(["tank_id", "all.battles", "all.wins"])  # poți limita răspunsul
-    }
+    },
+    timeout=15,
 ).json()
 
-if resp.get("status") != "ok" or not resp.get("data"):
-    print("❌ No tank stats available.")
-    exit()
+tank_data = stats_resp["data"].get(str(account_id), [])
 
-tank_data = resp["data"].get(str(account_id), [])
 if not tank_data:
-    print("❌ No tanks with statistics found.")
-    exit()
+    raise RuntimeError("No tank statistics found")
 
-# Prepare stats for weighted random
-tank_stats: List[Dict[str, Any]] = []
+print("Downloading vehicle encyclopedia...")
+
+vehicle_resp = requests.get(
+    f"{BASE_URL}/encyclopedia/vehicles/",
+    params={
+        "application_id": API_KEY
+    },
+    timeout=30,
+).json()
+
+vehicle_data = vehicle_resp.get("data", {})
+
+last_played = load_history()
+
+eligible_tanks = []
+
 for entry in tank_data:
-    stats_all = entry.get("all", {})
-    battles = stats_all.get("battles", 0)
-    if battles == 0:
-        continue  # skip tanks never played (or stats not loaded)
 
-    wins = stats_all.get("wins", 0)
-    winrate = (wins / battles * 100) if battles > 0 else 0.0
+    stats = entry.get("all", {})
 
-    if winrate < 50:  # only keep tanks below 50%
-        tank_stats.append({
-            "tank_id": entry["tank_id"],
+    battles = stats.get("battles", 0)
+    wins = stats.get("wins", 0)
+
+    if battles <= 0:
+        continue
+
+    winrate = wins / battles * 100
+
+    if winrate >= 50:
+        continue
+
+    tank_id = entry["tank_id"]
+
+    vehicle = vehicle_data.get(str(tank_id))
+
+    if not vehicle:
+        continue
+
+    tier = vehicle.get("tier", 0)
+
+    if not (MIN_TIER <= tier <= MAX_TIER):
+        continue
+
+    eligible_tanks.append(
+        {
+            "tank_id": tank_id,
+            "name": vehicle.get("name"),
+            "tier": tier,
+            "type": vehicle.get("type"),
+            "nation": vehicle.get("nation"),
             "battles": battles,
             "wins": wins,
-            "winrate": winrate
-        })
+            "winrate": winrate,
+        }
+    )
 
-if not tank_stats:
-    print("❌ No tanks with battles > 0.")
-    exit()
+if not eligible_tanks:
+    raise RuntimeError("No eligible tanks found")
 
-print(f"Found {len(tank_stats)} tanks with actual battles.")
+print(f"Loaded {len(eligible_tanks)} eligible tanks.")
 
-# ── Pick tank weighted inversely by winrate, then check tier ──
-def pick_tank_weighted() -> Dict[str, Any]:
-    while True:
-        # Exclude recently played
-        available = [t for t in tank_stats if t["tank_id"] not in last_played]
-        if not available:
-            available = tank_stats[:]  # reset if all were played recently
 
-        # Weights: higher weight = lower winrate (we want to improve weak tanks)
-        weights = [max(100 - t["winrate"], 1) for t in available]  # avoid 0 weight
-        total = sum(weights)
+def pick_tank() -> Dict[str, Any]:
 
-        # secrets.randbelow → crypto-safe
-        r = secrets.randbelow(int(total * 1000)) / 1000.0
-        upto = 0.0
+    available = [
+        tank
+        for tank in eligible_tanks
+        if tank["tank_id"] not in last_played
+    ]
 
-        for tank, weight in zip(available, weights):
-            upto += weight
-            if upto >= r:
-                # Get vehicle info (tier, name, type, nation)
-                v_resp = requests.get(
-                    f"{BASE_URL}/encyclopedia/vehicles/",
-                    params={"application_id": API_KEY, "tank_id": tank["tank_id"]}
-                ).json()
+    if len(available) < 3:
+        available = eligible_tanks
 
-                if v_resp.get("status") != "ok" or "data" not in v_resp:
-                    continue
+    weights = [
+        max(100 - tank["winrate"], 1)
+        for tank in available
+    ]
 
-                vehicle = v_resp["data"].get(str(tank["tank_id"]), {})
-                tier = vehicle.get("tier", 0)
+    chosen = random.choices(
+        available,
+        weights=weights,
+        k=1,
+    )[0]
 
-                if MIN_TIER <= tier <= MAX_TIER:
-                    last_played.append(tank["tank_id"])
-                    if len(last_played) > HISTORY_SIZE:
-                        last_played.pop(0)
-                    return {**tank, **vehicle}
+    last_played.append(chosen["tank_id"])
 
-                # If tier not in range → loop again (pick another)
-                break
+    if len(last_played) > HISTORY_SIZE:
+        last_played.pop(0)
 
-chosen = pick_tank_weighted()
+    save_history(last_played)
 
-print("\n🎲 Random Tank (weighted by inverse personal winrate)")
-print(f"Name    : {chosen.get('name', 'Unknown')}")
-print(f"Tier    : {chosen.get('tier', 'Unknown')}")
-print(f"Type    : {chosen.get('type', 'Unknown')}")
-print(f"Nation  : {chosen.get('nation', 'Unknown')}")
-print(f"Battles : {chosen['battles']}, Wins: {chosen['wins']}, Winrate: {chosen['winrate']:.2f}%")
+    return chosen
+
+
+while True:
+
+    tank = pick_tank()
+
+    print("\n" + "=" * 50)
+    print("🎲 RANDOM TANK")
+    print("=" * 50)
+
+    print(f"Name    : {tank['name']}")
+    print(f"Tier    : {tank['tier']}")
+    print(f"Type    : {tank['type']}")
+    print(f"Nation  : {tank['nation']}")
+    print(f"Battles : {tank['battles']:,}")
+    print(f"Wins    : {tank['wins']:,}")
+    print(f"WR      : {tank['winrate']:.2f}%")
+    print(f"History : {len(last_played)}/{HISTORY_SIZE}")
+
+    print("\n[Any key] Another tank")
+    print("[Q] Quit")
+
+    key = msvcrt.getch().lower()
+
+    if key == b"q":
+        break
